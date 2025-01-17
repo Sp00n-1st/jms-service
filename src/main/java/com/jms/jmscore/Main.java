@@ -6,14 +6,18 @@ import java.io.InputStream;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
+import java.util.Enumeration;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import javax.jms.Connection;
+import javax.jms.JMSException;
 import javax.jms.Message;
 import javax.jms.MessageConsumer;
 import javax.jms.MessageListener;
@@ -36,41 +40,22 @@ public class Main {
 	private static Connection connection;
 	private static ActiveMQConnectionFactory factory;
 	private static java.sql.Connection connectionDb;
+	private static Boolean running = true;
 
 	public static void main(String[] args) throws Exception {
-		Runtime.getRuntime().addShutdownHook(new Thread() {
-			public void run() {
-				try {
-					if (consumer != null) {
-						consumer.close();
-						System.out.println("Consumer Close");
-					}
-					if (session != null) {
-						session.close();
-						System.out.println("Session Close");
-					}
-					if (connection != null) {
-						connection.close();
-						System.out.println("Connection Close");
-					}
-					if (factory != null) {
-						factory.close();
-						System.out.println("Factory Close");
-					}
-					if (connectionDb != null) {
-						connectionDb.close();
-						System.out.println("Connection DB Close");
-					}
-				} catch (Exception e) {
-					e.printStackTrace();
-				} finally {
-					System.exit(0);
-				}
-			}
-		});
-
 		logger.setLevel(Level.ALL);
 		logger.info("Start JMS Service...");
+
+		Boolean checkMessage = false;
+		Boolean schedule = false;
+		if (args.length > 0 && (!args[0].isEmpty() || !args[1].isEmpty())) {
+			if (args[0].equals("true")) {
+				checkMessage = true;
+			}
+			if (args.length > 1 && args[1].equals("true")) {
+				schedule = true;
+			}
+		}
 
 		long startTime = System.currentTimeMillis();
 
@@ -99,9 +84,104 @@ public class Main {
 		connectionDb = DriverManager.getConnection(properties.getProperty("datasource.url"),
 				properties.getProperty("datasource.username"), properties.getProperty("datasource.password"));
 
-		getMsg(consumer, session, connection, factory, connectionDb, properties);
+		if ((schedule && checkMessage) || (!checkMessage && !schedule)) {
+			Runtime.getRuntime().addShutdownHook(new Thread() {
+				public void run() {
+					try {
+						running = false;
+						if (consumer != null) {
+							consumer.close();
+						}
+						if (session != null) {
+							session.close();
+						}
+						if (connection != null) {
+							connection.close();
+						}
+						if (factory != null) {
+							factory.close();
+						}
+						if (connectionDb != null) {
+							connectionDb.close();
+						}
+					} catch (Exception e) {
+						e.printStackTrace();
+					} finally {
+						System.exit(0);
+					}
+				}
+			});
+			if (checkMessage) {
+				try {
+					while (running) {
+						checkMessage(properties);
+						Thread.sleep(Long.parseLong(properties.getProperty("time-schedule-check")));
+					}
+				} catch (Exception e) {
+					e.printStackTrace();
+				}
+			} else {
+				getMsg(consumer, session, connection, factory, connectionDb, properties);
+			}
+		} else {
+			checkMessage(properties);
+		}
+
+		consumer.close();
+		session.close();
+		connection.close();
+		factory.close();
+		connectionDb.close();
+
+		System.exit(0);
 
 		logger.info("Time To Done Operation " + (System.currentTimeMillis() - startTime) / 1000.0 + " Second");
+	}
+
+	private static void checkMessage(Properties properties) throws JMSException, Exception {
+		logger.info("Start Check Message To Queue");
+		Set<String> datasOut = new HashSet<>();
+		Set<String> datasIn = new HashSet<>();
+		Enumeration<?> messagesOut = session
+				.createBrowser(session.createQueue(properties.getProperty("artemis.queue-out")))
+				.getEnumeration();
+		while (messagesOut.hasMoreElements()) {
+			Message message = (Message) messagesOut.nextElement();
+			if (message instanceof TextMessage) {
+				datasOut.add(message.getObjectProperty("JmsId").toString());
+			}
+		}
+
+		Enumeration<?> messagesIn = session
+				.createBrowser(session.createQueue(properties.getProperty("artemis.queue-in")))
+				.getEnumeration();
+		while (messagesIn.hasMoreElements()) {
+			Message message = (Message) messagesIn.nextElement();
+			if (message instanceof TextMessage) {
+				datasIn.add(message.getObjectProperty("JmsId").toString());
+			}
+		}
+
+		int batchSize = Integer.parseInt(properties.getProperty("batch-size-update"));
+		Set<Set<String>> chunkDatasIn = chunkSet(datasIn, batchSize);
+		Set<Set<String>> chunkDataOut = chunkSet(datasOut, batchSize);
+
+		for (Set<String> dataIn : chunkDatasIn) {
+			updateDataBatch(dataIn, connectionDb, properties, false);
+		}
+
+		for (Set<String> dataOut : chunkDataOut) {
+			updateDataBatch(dataOut, connectionDb, properties, true);
+		}
+
+		if (chunkDatasIn.size() == 0) {
+			updateDataBatch(null, connectionDb, properties, false);
+		}
+		if (chunkDataOut.size() == 0) {
+			updateDataBatch(null, connectionDb, properties, true);
+		}
+
+		logger.info("Done Check Message To Queue");
 	}
 
 	private static void getMsg(MessageConsumer consumer, Session session, Connection connection,
@@ -296,6 +376,55 @@ public class Main {
 			e.printStackTrace();
 			throw e;
 		}
+	}
+
+	private static int updateDataBatch(Set<String> datas, java.sql.Connection connection, Properties properties,
+			Boolean isOut) throws Exception {
+		try {
+			DatabaseService databaseService = new DatabaseServiceImpl(connection);
+			StringBuilder query = new StringBuilder("UPDATE " + properties.getProperty("datasource.schema.in"));
+			if (isOut) {
+				query = new StringBuilder("UPDATE " + properties.getProperty("datasource.schema.out"));
+			}
+			if (datas != null) {
+				StringBuilder queryIn = new StringBuilder("(");
+				for (int i = 0; i < datas.size(); i++) {
+					queryIn.append("?");
+					if (i < datas.size() - 1) {
+						queryIn.append(", ");
+					}
+				}
+				queryIn.append(") ");
+
+				query.append(" SET IS_CONSUME = CASE " +
+						"WHEN JMS_ID IN " + queryIn.toString() + "THEN 0 " +
+						"WHEN JMS_ID NOT IN " + queryIn.toString() + "AND IS_CONSUME = 0 THEN 1 " +
+						"ELSE IS_CONSUME " +
+						"END " +
+						"WHERE JMS_ID IN " + queryIn.toString() +
+						"OR (JMS_ID NOT IN " + queryIn.toString() + "AND IS_CONSUME = 0)");
+			} else {
+				query.append(" SET IS_CONSUME = 1 " +
+						"WHERE IS_CONSUME = 0");
+			}
+
+			return databaseService.queryUpdate(query.toString(), datas);
+		} catch (Exception e) {
+			e.printStackTrace();
+			throw e;
+		}
+	}
+
+	public static Set<Set<String>> chunkSet(Set<String> set, int chunkSize) {
+		Set<Set<String>> chunks = new HashSet<>();
+		List<String> list = new ArrayList<>(set);
+
+		for (int i = 0; i < list.size(); i += chunkSize) {
+			Set<String> chunk = new HashSet<>(list.subList(i, Math.min(i + chunkSize, list.size())));
+			chunks.add(chunk);
+		}
+
+		return chunks;
 	}
 
 	private static Object getFieldFromXml(String field, String data) {

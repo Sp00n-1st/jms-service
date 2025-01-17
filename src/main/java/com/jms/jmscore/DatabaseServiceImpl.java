@@ -85,6 +85,62 @@ public class DatabaseServiceImpl implements DatabaseService {
     }
 
     @Override
+    public int queryUpdate(String query, Set<String> datas) throws SQLException {
+        PreparedStatement prepareStatement = null;
+        int[] rowsAffected = new int[100];
+        try {
+            connection.setAutoCommit(false);
+            prepareStatement = connection.prepareStatement(query);
+
+            if (datas != null) {
+                List<String> dataList = new ArrayList<>(datas);
+                int paramIndex = 1;
+
+                for (int j = 0; j < 4; j++) {
+                    for (int i = 0; i < datas.size(); i++) {
+                        prepareStatement.setString(paramIndex++, dataList.get(i));
+                    }
+                }
+            }
+
+            prepareStatement.addBatch();
+            rowsAffected = prepareStatement.executeBatch();
+            connection.commit();
+        } catch (SQLException e) {
+            e.printStackTrace();
+            try {
+                if (connection != null) {
+                    connection.rollback();
+                }
+            } catch (SQLException rollbackEx) {
+                rollbackEx.printStackTrace();
+                throw rollbackEx;
+            }
+            throw e;
+        } finally {
+            if (prepareStatement != null) {
+                try {
+                    prepareStatement.close();
+                } catch (SQLException e) {
+                    e.printStackTrace();
+                    throw e;
+                }
+            }
+
+            if (connection != null) {
+                try {
+                    connection.setAutoCommit(true);
+                } catch (SQLException e) {
+                    e.printStackTrace();
+                    throw e;
+                }
+            }
+        }
+
+        return Arrays.stream(rowsAffected).sum();
+    }
+
+    @Override
     public List<List<String>> queryData(String query, String[] columnNameArr,
             boolean withHeader) {
         List<List<String>> results = new ArrayList<List<String>>();
